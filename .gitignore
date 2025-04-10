@@ -1,0 +1,51 @@
+# Python virtual environment
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Credentials and secrets
+token.json
+service_account.json
+credentials.json
+
+# File uploads
+uploads/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/ 
