@@ -1,4 +1,4 @@
-#An AI-powered tool that extracts financial data from PDF documents and updates Google Sheets automatically.
+# An AI-powered tool that extracts financial data from PDF documents and updates Google Sheets automatically.
 
 ## Features
 
