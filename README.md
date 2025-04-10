@@ -1,13 +1,5 @@
 An AI-powered tool that extracts financial data from PDF documents and updates Google Sheets automatically.
 
-<img width="1470" alt="Screenshot 2025-04-11 at 4 06 28 AM" src="https://github.com/user-attachments/assets/0a608622-9416-4c18-91a6-6c7560525ce4" />
-
-<img width="1470" alt="Screenshot 2025-04-11 at 4 06 15 AM" src="https://github.com/user-attachments/assets/874bd78a-bafa-45b8-8fa2-2d6e4e59db5c" />
-
-<img width="1470" alt="Screenshot 2025-04-11 at 4 06 05 AM" src="https://github.com/user-attachments/assets/9d577097-fbb3-45c8-8a63-bbef00b921d7" />
-
-<img width="1470" alt="Screenshot 2025-04-11 at 4 03 27 AM" src="https://github.com/user-attachments/assets/5240c8db-89fc-4492-80b5-cba004972143" />
-
 ## Features
 
 - **PDF Extraction**: Extract structured and semi-structured data from financial PDF documents
@@ -18,6 +10,14 @@ An AI-powered tool that extracts financial data from PDF documents and updates G
 - **User-friendly Interface**: Simple web UI for uploading PDFs, connecting to sheets, and querying data
 
 ## Getting Started
+
+<img width="1470" alt="Screenshot 2025-04-11 at 4 06 28 AM" src="https://github.com/user-attachments/assets/0a608622-9416-4c18-91a6-6c7560525ce4" />
+
+<img width="1470" alt="Screenshot 2025-04-11 at 4 06 15 AM" src="https://github.com/user-attachments/assets/874bd78a-bafa-45b8-8fa2-2d6e4e59db5c" />
+
+<img width="1470" alt="Screenshot 2025-04-11 at 4 06 05 AM" src="https://github.com/user-attachments/assets/9d577097-fbb3-45c8-8a63-bbef00b921d7" />
+
+<img width="1470" alt="Screenshot 2025-04-11 at 4 03 27 AM" src="https://github.com/user-attachments/assets/5240c8db-89fc-4492-80b5-cba004972143" />
 
 ### Prerequisites
 
