@@ -1,5 +1,3 @@
-<img width="1470" alt="Screenshot 2025-04-11 at 4 06 28 AM" src="https://github.com/user-attachments/assets/839a2ca8-9b74-455e-a3db-08d4d7a3db53" /># Financial PDF to Google Sheets
-
 An AI-powered tool that extracts financial data from PDF documents and updates Google Sheets automatically.
 
 <img width="1470" alt="Screenshot 2025-04-11 at 4 06 28 AM" src="https://github.com/user-attachments/assets/0a608622-9416-4c18-91a6-6c7560525ce4" />
