@@ -50,15 +50,9 @@ class QuerySession:
         Load available sheets from the Google Sheet and store their matrices
         """
         try:
-            # Try different import paths
-            try:
-                from google_sheets_access import get_sheet_data, get_worksheet_names
-            except ModuleNotFoundError:
-                try:
-                    from sheets_manager import get_sheet_data, get_worksheet_names
-                except ModuleNotFoundError:
-                    from truffles.sheets_manager import get_sheet_data, get_worksheet_names
-                    
+            # Fix the import statement - removing the "truffles." prefix
+            from google_sheets_access import get_sheet_data, get_worksheet_names
+            
             # Get available worksheet names
             self.available_sheets = get_worksheet_names(self.sheet_url)
             logger.info(f"Found sheets: {self.available_sheets}")
@@ -1801,7 +1795,7 @@ def execute_action(session, action_info, spreadsheet_id=None):
                     abs_credentials_path = os.path.abspath(credentials_path)
                     logger.info(f"Trying absolute path: {abs_credentials_path}")
                     credentials = service_account.Credentials.from_service_account_file(
-                        abs_path,
+                        abs_credentials_path,
                         scopes=['https://www.googleapis.com/auth/spreadsheets']
                     )
                     logger.info(f"Successfully loaded credentials from absolute path: {abs_credentials_path}")
@@ -1953,15 +1947,7 @@ Make sure to return valid JSON that can be parsed. The updated_matrix should inc
                 
                 # Get sheet structure for all tabs
                 try:
-                    # Try different import paths
-                    try:
-                        from sheets_manager import get_sheet_structure
-                    except ModuleNotFoundError:
-                        try:
-                            from truffles.sheets_manager import get_sheet_structure
-                        except ModuleNotFoundError:
-                            raise ImportError("Could not import get_sheet_structure from any module")
-                        
+                    from sheets_manager import get_sheet_structure
                     sheet_structure = get_sheet_structure(session.sheet_url)
                     logger.info(f"Got sheet structure: {len(sheet_structure.get('sheets', []))} sheets")
                 except Exception as e:
@@ -1990,31 +1976,24 @@ Make sure to return valid JSON that can be parsed. The updated_matrix should inc
                     
                     # Use the simple mapper to get the filled matrix for this sheet
                     try:
-                        # Try different import paths
-                        try:
-                            from simple_mapper import map_financial_data
-                        except ModuleNotFoundError:
-                            try:
-                                from truffles.simple_mapper import map_financial_data
-                            except ModuleNotFoundError:
-                                raise ImportError("Could not import map_financial_data from any module")
-                            
+                        from simple_mapper import map_financial_data
                         logger.info(f"Mapping financial data for sheet: '{sheet_name}'")
                         mapping_result = map_financial_data(session.financial_data, matrix)
                         
-                        # Store full matrix in memory for later use
-                        filled_matrix = mapping_result.get('filled_matrix', [])
-                        
-                        # Store in session matrices
-                        session.sheet_matrices[sheet_name] = filled_matrix
-                        
-                        # Add to results - IMPORTANT: Keep 'filled_matrix' key for UI compatibility
+                        # Add to results
                         all_mapping_results.append({
                             'sheet_name': sheet_name,
-                            'filled_matrix': filled_matrix,  # Use exact same key as expected by UI
+                            'filled_matrix': mapping_result.get('filled_matrix', []),
                             'stats': mapping_result.get('stats', {}),
                             'status': 'success'
                         })
+                        
+                        # Update the session matrix for this sheet
+                        session.sheet_matrices[sheet_name] = mapping_result.get('filled_matrix', [])
+                        
+                        # Update preview matrix for UI
+                        preview_matrix = mapping_result.get('filled_matrix', [])[:5]  # First 5 rows
+                        session.sheet_matrices[f"{sheet_name}_preview"] = preview_matrix
                         
                         logger.info(f"Successfully mapped data for sheet '{sheet_name}': {mapping_result.get('stats', {})}")
                     except Exception as e:
@@ -2025,75 +2004,27 @@ Make sure to return valid JSON that can be parsed. The updated_matrix should inc
                             'status': 'error'
                         })
                 
-                # Try to store mapping results in the required Flask session variables
+                # Try to store mapping results in Flask session for the UI
                 try:
                     from flask import session as flask_session
-                    
-                    # Create a preview version with limited data for session storage
-                    preview_results = []
-                    for result in all_mapping_results:
-                        if result.get('status') == 'success':
-                            # Create a copy without the full matrix
-                            preview_result = result.copy()
-                            full_matrix = preview_result.get('filled_matrix', [])
-                            # Only keep first 5 rows for preview
-                            preview_result['filled_matrix'] = full_matrix[:5] if full_matrix else []
-                            preview_results.append(preview_result)
-                        else:
-                            # Error results don't have matrices, so include as-is
-                            preview_results.append(result)
-                    
-                    # Store in the exact same session variable used by app.py
                     flask_session['all_mapping_results'] = json.dumps(all_mapping_results)
-                    logger.info("Stored mapping results in Flask session (may be large)")
-                    
-                    # Also store a more compact version for backup
-                    flask_session['all_mapping_results_preview'] = json.dumps(preview_results)
-                    logger.info("Stored compact mapping results preview")
-                    
-                    # Add flags to help the UI know to refresh
-                    flask_session['mapping_regenerated'] = True
-                    flask_session['mapping_timestamp'] = int(time.time())
-                    
-                    # Force a session save
-                    try:
-                        flask_session.modified = True
-                    except:
-                        pass
-                        
+                    logger.info("Stored mapping results in Flask session")
                 except Exception as e:
-                    logger.error(f"Error storing mapping results in Flask session: {str(e)}")
-                    logger.error(traceback.format_exc())
+                    logger.warning(f"Could not store mapping results in Flask session: {str(e)}")
                 
                 # If we have at least one successful mapping, use it as the default filled matrix
                 for result in all_mapping_results:
                     if result.get('status') == 'success':
-                        # Find the corresponding full matrix in session.sheet_matrices
-                        sheet_name = result.get('sheet_name')
-                        if sheet_name in session.sheet_matrices:
-                            session.filled_matrix = session.sheet_matrices[sheet_name]
-                            logger.info(f"Set default filled matrix from sheet '{sheet_name}'")
+                        filled_matrix = result.get('filled_matrix', [])
+                        if filled_matrix:
+                            session.filled_matrix = filled_matrix
+                            logger.info(f"Set default filled matrix from sheet '{result.get('sheet_name')}'")
                             break
                 
                 # Count successful and failed mappings
                 successful = sum(1 for r in all_mapping_results if r.get('status') == 'success')
                 failed = sum(1 for r in all_mapping_results if r.get('status') == 'error')
                 skipped = sum(1 for r in all_mapping_results if r.get('status') == 'skipped')
-                
-                # Create a special notification for the UI
-                try:
-                    from flask import session as flask_session
-                    
-                    # Save a notification for the frontend to display
-                    notification = {
-                        "type": "success",
-                        "message": f"Mapping regenerated successfully for {successful} sheets. Ready to migrate to Google Sheets.",
-                        "timestamp": int(time.time())
-                    }
-                    flask_session['notification'] = json.dumps(notification)
-                    flask_session.modified = True
-                except:
-                    pass
                 
                 # Now build result for display
                 status_message = f"Regenerated mapping for {successful} sheets successfully."
@@ -2106,12 +2037,10 @@ Make sure to return valid JSON that can be parsed. The updated_matrix should inc
                 return {
                     "success": successful > 0,
                     "message": status_message,
-                    "mapping_results": all_mapping_results,  # Use key expected by UI
+                    "mapping_results": all_mapping_results,
                     "successful_mappings": successful,
                     "failed_mappings": failed,
-                    "skipped_mappings": skipped,
-                    "ready_to_migrate": True,  # Indicate that migration is ready but not performed
-                    "note": "The mapping has been regenerated and is ready for migration, but no data has been sent to Google Sheets yet."
+                    "skipped_mappings": skipped
                 }
                 
             except Exception as e:
