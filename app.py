@@ -4,12 +4,76 @@ from werkzeug.utils import secure_filename
 import uuid
 import json
 from dotenv import load_dotenv
+import shutil
+import logging
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-from pdf_processor import extract_financial_data_from_pdf
-from sheets_manager import get_sheet_structure, apply_mapping_result, extract_spreadsheet_id, create_new_sheet
-from mapping_engine import map_pdf_data_to_sheet
+from pdf_processor import extract_financial_data_from_pdf, detect_document_type
+from sheets_manager import get_sheet_structure, extract_spreadsheet_id, create_new_sheet, test_google_sheets_access, get_credentials
+# Import simple_mapper functionality only
+from simple_mapper import map_financial_data, save_context_to_file
+# Import query processor functionality
+from query_processor import QuerySession, process_query, execute_action
 
 load_dotenv()
+
+# Ensure credentials are set up
+def setup_google_credentials():
+    """Set up Google API credentials from the credentials.json file"""
+    # Define the paths
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(app_dir)
+    source_credentials = os.path.join(project_dir, 'credentials.json')
+    target_credentials = 'credentials.json'  # In the working directory
+    
+    # Copy credentials.json to the right location if it doesn't exist
+    if os.path.exists(source_credentials) and not os.path.exists(target_credentials):
+        shutil.copy(source_credentials, target_credentials)
+        print(f"Copied credentials.json to {target_credentials}")
+        
+    # If source file doesn't exist but the one in app folder does exist, all good    
+    elif os.path.exists(target_credentials):
+        print(f"credentials.json already exists at {target_credentials}")
+    
+    # Neither source nor target exist    
+    else:
+        print("Warning: credentials.json not found. Google Sheets integration may not work.")
+    
+    # Test Google Sheets access
+    test_google_sheets_access()
+
+def test_google_sheets_access():
+    """Test if Google Sheets API is accessible with current credentials."""
+    try:
+        # Get credentials and build the Sheets API service
+        creds = get_credentials()
+        if not creds:
+            logging.warning("No valid Google credentials found")
+            return False
+            
+        service = build('sheets', 'v4', credentials=creds)
+        
+        # Make a simple API call to test access
+        # Just get the spreadsheet metadata for a dummy spreadsheet ID
+        # This will fail with a 404, but that's expected - we just want to check auth
+        try:
+            service.spreadsheets().get(spreadsheetId="1").execute()
+        except HttpError as error:
+            # 404 error is expected since we're using a dummy ID
+            if error.resp.status == 404:
+                return True
+            else:
+                logging.warning(f"Google Sheets API error: {error}")
+                return False
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error testing Google Sheets access: {e}")
+        return False
+
+# Run setup
+setup_google_credentials()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "default-secret-key")
@@ -26,7 +90,9 @@ def allowed_file(filename):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # Check if Google Sheets access is working
+    google_sheets_working = test_google_sheets_access()
+    return render_template('index.html', google_sheets_working=google_sheets_working)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -146,7 +212,7 @@ def get_sheet_structure_endpoint():
 
 @app.route('/preview-mapping', methods=['POST'])
 def preview_mapping():
-    """Preview how data will be mapped without sending to sheets"""
+    """Preview how data will be mapped across all sheets"""
     if 'pdf_filepath' not in session:
         return jsonify({'error': 'No PDF data found. Please upload a PDF first.'}), 400
     
@@ -155,94 +221,182 @@ def preview_mapping():
         return jsonify({'error': 'Google Sheet URL is required'}), 400
     
     try:
-        # Get sheet structure
+        # Get sheet structure for all tabs
         sheet_structure = get_sheet_structure(sheet_url)
         
         # Load PDF data from cached file
         pdf_data = load_pdf_data()
         
-        # Map PDF data to sheet structure using OpenAI
-        api_key = os.environ.get('OPENAI_API_KEY')
-        mapping_result = map_pdf_data_to_sheet(pdf_data, sheet_structure, use_openai=True, api_key=api_key)
+        # Check if we have sheets to process
+        if not sheet_structure.get('sheets'):
+            return jsonify({'error': 'No sheets found in the spreadsheet'}), 400
         
-        return jsonify({
+        # Process each sheet tab
+        all_mapping_results = []
+        
+        for sheet in sheet_structure.get('sheets', []):
+            sheet_name = sheet.get('title', 'Unnamed Sheet')
+            matrix = sheet.get('values', [])
+            
+            # Skip empty sheets
+            if not matrix:
+                all_mapping_results.append({
+                    'sheet_name': sheet_name,
+                    'error': 'Sheet is empty',
+                    'status': 'skipped'
+                })
+                continue
+            
+            # Use the simple mapper to get the filled matrix for this sheet
+            try:
+                mapping_result = map_financial_data(pdf_data, matrix)
+                
+                # Add to results
+                all_mapping_results.append({
+                    'sheet_name': sheet_name,
+                    'filled_matrix': mapping_result.get('filled_matrix', []),
+                    'stats': mapping_result.get('stats', {}),
+                    'status': 'success'
+                })
+            except Exception as e:
+                all_mapping_results.append({
+                    'sheet_name': sheet_name,
+                    'error': str(e),
+                    'status': 'error'
+                })
+        
+        # Store the mapping results in the session for later use
+        session['all_mapping_results'] = json.dumps(all_mapping_results)
+        
+        # Format the result for the preview
+        result = {
             'success': True,
-            'mapping_preview': mapping_result,
-            'spreadsheet_id': extract_spreadsheet_id(sheet_url)
-        })
+            'mapping_results': all_mapping_results,
+            'spreadsheet_id': extract_spreadsheet_id(sheet_url),
+            'spreadsheet_title': sheet_structure.get('title', 'Untitled Spreadsheet')
+        }
+        
+        return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/map-to-sheet', methods=['POST'])
 def map_to_sheet():
-    if 'pdf_filepath' not in session:
-        return jsonify({'error': 'No PDF data found. Please upload a PDF first.'}), 400
+    """Migrate the filled matrices to Google Sheets"""
+    if 'pdf_filepath' not in session or 'all_mapping_results' not in session:
+        return jsonify({'error': 'No mapping data found. Please preview the mapping first.'}), 400
     
     sheet_url = request.form.get('sheet_url')
     if not sheet_url:
         return jsonify({'error': 'Google Sheet URL is required'}), 400
     
-    # Check if we should create a new sheet
+    # Check if we should create new sheets
     create_new = request.form.get('create_new', 'false') == 'true'
     
+    # Get selected sheets to migrate
+    selected_sheets = request.form.getlist('selected_sheets')
+    if not selected_sheets:
+        return jsonify({'error': 'No sheets selected for migration'}), 400
+    
     try:
-        # Get sheet structure
-        sheet_structure = get_sheet_structure(sheet_url)
+        # Get the mapping results from the session
+        all_mapping_results = json.loads(session['all_mapping_results'])
         
-        # Load PDF data from cached file
-        pdf_data = load_pdf_data()
+        # Filter to only include selected sheets
+        migration_results = []
         
-        # Map PDF data to sheet structure using OpenAI
-        api_key = os.environ.get('OPENAI_API_KEY')
-        mapping_result = map_pdf_data_to_sheet(pdf_data, sheet_structure, use_openai=True, api_key=api_key)
+        # Get spreadsheet ID
+        spreadsheet_id = extract_spreadsheet_id(sheet_url)
         
-        # If create_new is true, modify the mapping to create new sheets
-        if create_new and 'updates' in mapping_result:
-            # Group updates by sheet name
-            updates_by_sheet = {}
-            for update in mapping_result['updates']:
-                sheet_name = update.get('sheet_name')
-                if sheet_name not in updates_by_sheet:
-                    updates_by_sheet[sheet_name] = []
-                updates_by_sheet[sheet_name].append(update)
+        # Initialize Google Sheets API
+        from googleapiclient.discovery import build
+        from sheets_manager import get_credentials
+        
+        creds = get_credentials()
+        service = build('sheets', 'v4', credentials=creds)
+        
+        # Process each selected sheet
+        for sheet_result in all_mapping_results:
+            sheet_name = sheet_result.get('sheet_name')
             
-            # Create new sheets info
-            new_sheets = []
-            for sheet_name, updates in updates_by_sheet.items():
-                # Create a new sheet name with timestamp
+            # Skip sheets that weren't selected
+            if sheet_name not in selected_sheets:
+                continue
+                
+            # Skip sheets that had errors
+            if sheet_result.get('status') != 'success':
+                migration_results.append({
+                    'sheet_name': sheet_name,
+                    'status': 'skipped',
+                    'message': f"Sheet was skipped due to previous errors: {sheet_result.get('error', 'Unknown error')}"
+                })
+                continue
+            
+            filled_matrix = sheet_result.get('filled_matrix', [])
+            stats = sheet_result.get('stats', {})
+            
+            if create_new:
+                # Generate a unique name for the new sheet
                 timestamp = uuid.uuid4().hex[:8]
                 new_sheet_name = f"{sheet_name}_filled_{timestamp}"
                 
-                # Add to new sheets list
-                new_sheets.append({
-                    'title': new_sheet_name,
-                    'source_sheet': sheet_name,
-                    'updates': updates
+                # Create a new sheet with the filled matrix
+                result = create_new_sheet(
+                    service,
+                    spreadsheet_id,
+                    new_sheet_name,
+                    headers=None,  # No separate headers, everything is in the matrix
+                    data=filled_matrix
+                )
+                
+                migration_results.append({
+                    'sheet_name': sheet_name,
+                    'new_sheet_name': new_sheet_name,
+                    'status': 'created',
+                    'stats': stats,
+                    'message': f'Created new sheet: {new_sheet_name}'
                 })
-            
-            # Update mapping result to use new sheet names
-            modified_updates = []
-            for update in mapping_result['updates']:
-                sheet_name = update.get('sheet_name')
-                for new_sheet in new_sheets:
-                    if new_sheet['source_sheet'] == sheet_name:
-                        # Update the sheet name to the new one
-                        update['sheet_name'] = new_sheet['title']
-                        break
-                modified_updates.append(update)
-            
-            # Replace updates with modified updates
-            mapping_result['updates'] = modified_updates
-        
-        # Apply the mapping to the sheet
-        result = apply_mapping_result(sheet_url, mapping_result)
+            else:
+                # REPLACE the existing sheet with the filled matrix
+                try:
+                    # First, clear the entire sheet
+                    clear_request = service.spreadsheets().values().clear(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"{sheet_name}"
+                    )
+                    clear_request.execute()
+                    
+                    # Then update with the new matrix
+                    update_range = f"{sheet_name}!A1"
+                    body = {
+                        'values': filled_matrix
+                    }
+                    
+                    update_result = service.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=update_range,
+                        valueInputOption='USER_ENTERED',
+                        body=body
+                    ).execute()
+                    
+                    migration_results.append({
+                        'sheet_name': sheet_name,
+                        'status': 'replaced',
+                        'stats': stats,
+                        'message': f'Replaced sheet: {sheet_name}'
+                    })
+                except Exception as e:
+                    migration_results.append({
+                        'sheet_name': sheet_name,
+                        'status': 'error',
+                        'message': f'Error updating sheet {sheet_name}: {str(e)}'
+                    })
         
         return jsonify({
             'success': True,
-            'message': 'Data mapped and sheet updated successfully',
-            'mapping': mapping_result,
-            'update_result': result,
-            'spreadsheet_id': extract_spreadsheet_id(sheet_url)
+            'message': f'Migration completed for {len(migration_results)} sheets',
+            'migration_results': migration_results,
+            'spreadsheet_id': spreadsheet_id
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -321,6 +475,7 @@ def create_sheet_template():
 
 @app.route('/query', methods=['POST'])
 def handle_query():
+    """Handle a query about the data or Google Sheet"""
     if 'pdf_filepath' not in session:
         return jsonify({'error': 'No PDF data found. Please upload a PDF first.'}), 400
     
@@ -329,27 +484,117 @@ def handle_query():
         return jsonify({'error': 'Query is required'}), 400
     
     sheet_url = request.form.get('sheet_url')
-    if not sheet_url:
-        return jsonify({'error': 'Google Sheet URL is required'}), 400
+    sheet_name = request.form.get('sheet_name')
+    session_id = request.form.get('session_id')
         
     try:
-        # Load PDF data from cached file instead of re-processing
+        # Load PDF data from cached file
         pdf_data = load_pdf_data()
         
-        # Get sheet structure
-        sheet_structure = get_sheet_structure(sheet_url)
+        # Get mapping results if available
+        filled_matrix = None
+        if 'all_mapping_results' in session:
+            mapping_results = json.loads(session['all_mapping_results'])
+            # If sheet_name is specified, find that specific sheet's filled matrix
+            if sheet_name:
+                for result in mapping_results:
+                    if result.get('sheet_name') == sheet_name and result.get('status') == 'success':
+                        filled_matrix = result.get('filled_matrix')
+                        break
+            # Otherwise use the first successful mapping
+            else:
+                for result in mapping_results:
+                    if result.get('status') == 'success':
+                        filled_matrix = result.get('filled_matrix')
+                        sheet_name = result.get('sheet_name')
+                        break
         
-        # Process the query (implement this function in a query_processor.py file)
-        # For now, let's just return a placeholder
-        result = {
+        # Get or create a query session
+        query_session = None
+        spreadsheet_id = None
+        
+        if sheet_url:
+            spreadsheet_id = extract_spreadsheet_id(sheet_url)
+        
+        # Check if we have an existing session stored
+        if 'query_session' in session and session_id:
+            stored_session = json.loads(session['query_session'])
+            if stored_session.get('session_id') == session_id:
+                # Recreate the session with current data
+                query_session = QuerySession.from_dict(
+                    stored_session,
+                    financial_data=pdf_data,
+                    filled_matrix=filled_matrix
+                )
+        
+        # Create a new session if needed
+        if not query_session:
+            query_session = QuerySession(
+                financial_data=pdf_data,
+                filled_matrix=filled_matrix,
+                sheet_url=sheet_url,
+                sheet_name=sheet_name
+            )
+        
+        # Process the query
+        result = process_query(query_session, query)
+        
+        # Execute any actions if present
+        action_result = None
+        if result.get('action'):
+            action_result = execute_action(
+                query_session,
+                result.get('action'),
+                spreadsheet_id=spreadsheet_id
+            )
+        
+        # Store the session for future queries
+        session['query_session'] = json.dumps(query_session.to_dict())
+        
+        # Return the response
+        response = {
+            'success': True,
             'query': query,
-            'response': f"Query processing is not implemented yet. You asked: {query}"
+            'response': result.get('response'),
+            'session_id': query_session.session_id
         }
         
-        return jsonify({
-            'success': True,
-            'result': result
-        })
+        if action_result:
+            response['action_result'] = action_result
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# New route for saving the context to a file for debugging
+@app.route('/save-context', methods=['POST'])
+def save_context():
+    """Save the formatted context to a file for debugging"""
+    if 'pdf_filepath' not in session:
+        return jsonify({'error': 'No PDF data found. Please upload a PDF first.'}), 400
+    
+    try:
+        # Load PDF data from cached file
+        pdf_data = load_pdf_data()
+        
+        # Generate a filename for the context
+        context_filename = f"context_{uuid.uuid4().hex[:8]}.txt"
+        context_filepath = os.path.join(app.config['UPLOAD_FOLDER'], context_filename)
+        
+        # Save the context to a file
+        result = save_context_to_file(pdf_data, context_filepath)
+        
+        if result:
+            return jsonify({
+                'success': True,
+                'message': 'Context saved successfully',
+                'filepath': context_filepath
+            })
+        else:
+            return jsonify({'error': 'Failed to save context'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

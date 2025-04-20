@@ -6,6 +6,7 @@ import tabula
 import json
 import os
 import tempfile
+import shutil
 from PIL import Image
 import io
 import base64
@@ -18,6 +19,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import openai  # Adding openai explicitly
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib  # For generating unique file names
 
 # Note: pdf2image requires system dependencies:
 # - On macOS: brew install poppler
@@ -36,6 +38,171 @@ load_dotenv()
 # Configure logger
 logger = logging.getLogger(__name__)
 
+# Path for storing extracted PDF data
+def get_pdf_data_dir():
+    """
+    Get or create directory for storing extracted PDF data
+    
+    Returns:
+        str: Path to the PDF data directory
+    """
+    # Create in user's home directory to persist between sessions
+    pdf_data_dir = os.path.join(os.path.expanduser("~"), '.truffles', 'pdf_data')
+    os.makedirs(pdf_data_dir, exist_ok=True)
+    return pdf_data_dir
+
+def save_pdf_data(pdf_path, financial_data):
+    """
+    Save extracted PDF data to a file for later use
+    
+    Args:
+        pdf_path (str): Path to the original PDF file
+        financial_data (dict): Extracted financial data
+        
+    Returns:
+        str: Path to the saved data file
+    """
+    try:
+        # Create a unique filename based on the PDF path
+        pdf_basename = os.path.basename(pdf_path)
+        pdf_hash = hashlib.md5(pdf_path.encode()).hexdigest()[:10]
+        output_filename = f"{pdf_basename}_{pdf_hash}.json"
+        
+        # Save to the PDF data directory
+        data_dir = get_pdf_data_dir()
+        output_path = os.path.join(data_dir, output_filename)
+        
+        with open(output_path, 'w') as f:
+            json.dump(financial_data, f, indent=2)
+            
+        logger.info(f"Saved extracted PDF data to {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Error saving PDF data: {e}")
+        return None
+
+def load_pdf_data(pdf_path=None, data_path=None):
+    """
+    Load previously extracted PDF data
+    
+    Args:
+        pdf_path (str, optional): Path to the original PDF file
+        data_path (str, optional): Direct path to the saved data file
+        
+    Returns:
+        dict: Extracted financial data or None if not found
+    """
+    try:
+        # If data_path is provided, use it directly
+        if data_path and os.path.exists(data_path):
+            with open(data_path, 'r') as f:
+                logger.info(f"Loading PDF data from {data_path}")
+                return json.load(f)
+        
+        # If pdf_path is provided, try to find the matching data file
+        if pdf_path:
+            pdf_basename = os.path.basename(pdf_path)
+            pdf_hash = hashlib.md5(pdf_path.encode()).hexdigest()[:10]
+            expected_filename = f"{pdf_basename}_{pdf_hash}.json"
+            
+            data_dir = get_pdf_data_dir()
+            expected_path = os.path.join(data_dir, expected_filename)
+            
+            if os.path.exists(expected_path):
+                with open(expected_path, 'r') as f:
+                    logger.info(f"Loading PDF data from {expected_path}")
+                    return json.load(f)
+            else:
+                logger.warning(f"No saved data found for {pdf_path}")
+        
+        # If no matching file is found
+        return None
+    except Exception as e:
+        logger.error(f"Error loading PDF data: {e}")
+        return None
+
+# Create temporary directory for API responses
+def get_temp_response_dir():
+    """
+    Get or create temporary directory for storing API responses
+    
+    Returns:
+        str: Path to the temporary directory
+    """
+    temp_dir = os.path.join(tempfile.gettempdir(), 'truffles_responses')
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+def save_api_response(response, page_num, response_type="vision"):
+    """
+    Save API response to temporary file for debugging and caching
+    
+    Args:
+        response: The API response to save
+        page_num (int): Page number
+        response_type (str): Type of response (vision, kvp, etc.)
+        
+    Returns:
+        str: Path to the saved response file
+    """
+    try:
+        temp_dir = get_temp_response_dir()
+        response_file = os.path.join(temp_dir, f"openai_{response_type}_page_{page_num}.json")
+        
+        with open(response_file, 'w') as f:
+            if isinstance(response, dict):
+                json.dump(response, f, indent=2)
+            else:
+                # For string responses
+                f.write(str(response))
+                
+        logger.info(f"Saved {response_type} API response for page {page_num} to {response_file}")
+        return response_file
+    except Exception as e:
+        logger.error(f"Error saving API response: {e}")
+        return None
+
+def load_api_response(page_num, response_type="vision"):
+    """
+    Load API response from temporary file if it exists
+    
+    Args:
+        page_num (int): Page number
+        response_type (str): Type of response (vision, kvp, etc.)
+        
+    Returns:
+        dict or None: The loaded response or None if not found
+    """
+    try:
+        temp_dir = get_temp_response_dir()
+        response_file = os.path.join(temp_dir, f"openai_{response_type}_page_{page_num}.json")
+        
+        if os.path.exists(response_file):
+            with open(response_file, 'r') as f:
+                logger.info(f"Loading cached {response_type} API response for page {page_num}")
+                return json.load(f)
+        return None
+    except Exception as e:
+        logger.error(f"Error loading API response: {e}")
+        return None
+
+def cleanup_temp_responses():
+    """
+    Clean up temporary response files
+    
+    Returns:
+        bool: Success status
+    """
+    try:
+        temp_dir = get_temp_response_dir()
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary response directory: {temp_dir}")
+        return True
+    except Exception as e:
+        logger.error(f"Error cleaning up temporary responses: {e}")
+        return False
+
 # Google Sheets API integration
 
 def get_sheets_service():
@@ -47,7 +214,7 @@ def get_sheets_service():
     """
     try:
         # Get path to service account credentials file
-        credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'service_account.json')
+        credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', 'credentials.json')
         
         if not os.path.exists(credentials_path):
             logger.error(f"Service account credentials file not found at {credentials_path}")
@@ -452,60 +619,57 @@ def extract_tables_with_openai(img, page_num):
 
 def call_openai_vision(image_base64, api_key):
     """
-    Call OpenAI Vision API to extract tables
+    Call OpenAI Vision API to extract structured data from an image
     
     Args:
-        image_base64: Base64 encoded image
-        api_key: OpenAI API key
+        image_base64 (str): Base64-encoded image
+        api_key (str): OpenAI API key
         
     Returns:
         dict: OpenAI API response
     """
+    # Set up API key
+    openai.api_key = api_key
+    
+    # Define the prompt to extract structured data
+    prompt = """
+You are an expert in extracting financial data from images.
+Please extract all tables from this image of a financial document.
+For each table:
+1. Identify the table type (e.g., Balance Sheet, Income Statement, Cash Flow Statement)
+2. Extract all headers (columns and rows)
+3. Extract all data in the table
+4. Format as proper structured data
+
+Return the extracted data as valid JSON with this structure:
+[
+  {
+    "type": "Balance Sheet",
+    "headers": ["Assets", "2023", "2022"],
+    "data": [
+      ["Current Assets", "100,000", "90,000"],
+      ["Fixed Assets", "200,000", "180,000"],
+      ["Total Assets", "300,000", "270,000"]
+    ]
+  },
+  ... additional tables ...
+]
+"""
+    
     try:
-        # Set the API key
-        openai.api_key = api_key
-        
+        # Create the request
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4o",  # Use vision model
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a financial data extraction assistant specializing in table detection and extraction from financial documents. Your task is to extract tables from images and return them in a well-structured JSON format. Pay special attention to table titles, headers, and data.\n\nFor each table:\n1. Identify the EXACT title or caption of the table as it appears in the document\n2. Extract column headers precisely\n3. Extract all data rows accurately\n\nOnly return valid, parseable JSON with no explanations or additional text. Make sure all JSON objects have complete, properly quoted key-value pairs."
-                },
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": """
-                            Extract all tables from this financial document image.
-                            
-                            For each table, provide:
-                            - "type": The EXACT table title/caption as it appears in the document. Look for titles like "Balance Sheet", "Income Statement", "Statement of Cash Flows", etc. at the top of the table. If no explicit title is visible, use the content to determine the type.
-                            - "headers": Array of column headers exactly as they appear
-                            - "data": Array of arrays (rows of data)
-                            
-                            Return ONLY a JSON array of table objects. Format:
-                            
-                            [
-                              {
-                                "type": "Balance Sheet",
-                                "headers": ["Item", "2023", "2022"],
-                                "data": [
-                                  ["Assets", "100,000", "90,000"],
-                                  ["Liabilities", "50,000", "45,000"]
-                                ]
-                              }
-                            ]
-                            
-                            If there's only one table, still wrap it in an array. If no tables are found, return an empty array [].
-                            DO NOT include any text explanations - ONLY the JSON.
-                            """
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_base64}"
+                                "url": f"data:image/png;base64,{image_base64}",
+                                "detail": "high"
                             }
                         }
                     ]
@@ -514,6 +678,9 @@ def call_openai_vision(image_base64, api_key):
             max_tokens=4096,
             timeout=60  # Add timeout to prevent long-running requests
         )
+        
+        # Save the response to a temporary file
+        save_api_response(response, 0, "vision")  # We don't know the page number here, set later
         
         return response
     
@@ -595,45 +762,29 @@ def parse_openai_response(response, page_num):
         logger.info(f"Response from OpenAI on page {page_num}: {content[:100]}...")
         
         # Save raw response for debugging
-        debug_filename = f"openai_response_page_{page_num}.txt"
-        try:
-            with open(debug_filename, 'w') as f:
-                f.write(content)
-            logger.info(f"Saved raw response to {debug_filename}")
-        except:
-            pass
+        save_api_response(content, page_num, "vision_content")
         
-        # Try to extract JSON from response using various methods
+        # Try to parse the response as JSON
         try:
-            # First try: Look for JSON inside code blocks
-            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', content)
+            # Look for a JSON block in the content
+            import re
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', content)
+            
             if json_match:
                 json_str = json_match.group(1)
-                json_str = fix_json_string(json_str)
-                parsed_data = json.loads(json_str)
-                logger.info(f"Successfully parsed JSON from code block on page {page_num}")
+                table_list = json.loads(json_str)
             else:
-                # Second try: Look for any JSON-like structure with balanced braces
-                json_pattern = r'(\[[\s\S]*\])'  # Only array pattern for table list
-                match = re.search(json_pattern, content)
-                if match:
-                    json_str = match.group(0)
-                    json_str = fix_json_string(json_str)
-                    parsed_data = json.loads(json_str)
-                    logger.info(f"Successfully parsed JSON from direct match on page {page_num}")
-                else:
-                    # Third try: Clean up the text and try parsing the whole thing
-                    cleaned_content = content.strip()
-                    cleaned_content = fix_json_string(cleaned_content)
-                    parsed_data = json.loads(cleaned_content)
-                    logger.info(f"Successfully parsed JSON from full content on page {page_num}")
+                # Try to parse the whole content as JSON
+                json_str = fix_json_string(content)
+                table_list = json.loads(json_str)
             
-            # Handle both single table and array of tables
-            if isinstance(parsed_data, list):
-                table_list = parsed_data
-            else:
-                table_list = [parsed_data]
-                logger.info(f"Converted single table to list on page {page_num}")
+            # If we get a single table object, convert to a list
+            if isinstance(table_list, dict):
+                table_list = [table_list]
+            
+            if not isinstance(table_list, list):
+                logger.warning(f"Unexpected JSON format on page {page_num}: {type(table_list)}")
+                return tables
             
             for idx, table_data in enumerate(table_list):
                 # Skip if incomplete
@@ -1480,7 +1631,7 @@ def integrate_data_into_matrix(matrix, data_matrix):
         logger.error(f"Error integrating data into matrix: {str(e)}")
         return result_matrix
 
-def process_financial_pdf_to_sheets(pdf_path, spreadsheet_id, user_query=None, sheet_names=None):
+def process_financial_pdf_to_sheets(pdf_path, spreadsheet_id, user_query=None, sheet_names=None, reuse_data=True):
     """
     Complete workflow to process a financial PDF and update Google Sheets
     
@@ -1489,6 +1640,7 @@ def process_financial_pdf_to_sheets(pdf_path, spreadsheet_id, user_query=None, s
         spreadsheet_id: ID of the Google Sheets spreadsheet
         user_query: Optional user query to focus the update
         sheet_names: Optional list of sheet names to update
+        reuse_data: Whether to reuse previously extracted data if available
         
     Returns:
         dict: Results of the operation
@@ -1503,16 +1655,31 @@ def process_financial_pdf_to_sheets(pdf_path, spreadsheet_id, user_query=None, s
     try:
         logger.info(f"Starting financial PDF processing: {pdf_path}")
         
-        # 1. Extract data from PDF
-        financial_data = extract_financial_data_from_pdf(pdf_path)
+        # Check if we have previously extracted data for this PDF
+        financial_data = None
+        if reuse_data:
+            financial_data = load_pdf_data(pdf_path)
+            if financial_data:
+                logger.info(f"Using previously extracted data for {pdf_path}")
+                results['pdf_processed'] = True
         
-        if not financial_data or 'pages' not in financial_data or not financial_data['pages']:
-            logger.error("Failed to extract data from PDF")
-            results['errors'].append("Failed to extract data from PDF")
-            return results
-        
-        results['pdf_processed'] = True
-        logger.info(f"Successfully extracted data from PDF: {len(financial_data['pages'])} pages, {len(financial_data['tables'])} tables")
+        # Extract data from PDF if we don't have it already
+        if not financial_data:
+            financial_data = extract_financial_data_from_pdf(pdf_path)
+            
+            if not financial_data or 'pages' not in financial_data or not financial_data['pages']:
+                logger.error("Failed to extract data from PDF")
+                results['errors'].append("Failed to extract data from PDF")
+                cleanup_temp_responses()  # Clean up temp files
+                return results
+            
+            results['pdf_processed'] = True
+            logger.info(f"Successfully extracted data from PDF: {len(financial_data['pages'])} pages, {len(financial_data['tables'])} tables")
+            
+            # Save the extracted data for future use
+            data_path = save_pdf_data(pdf_path, financial_data)
+            if data_path:
+                results['data_saved'] = data_path
         
         # 2. Update Google Sheets with extracted data
         if spreadsheet_id:
@@ -1530,11 +1697,15 @@ def process_financial_pdf_to_sheets(pdf_path, spreadsheet_id, user_query=None, s
         else:
             logger.warning("No spreadsheet ID provided, skipping Google Sheets update")
         
+        # 3. Clean up temporary files
+        cleanup_temp_responses()
+        
         return results
     
     except Exception as e:
         logger.error(f"Error in processing financial PDF to sheets: {str(e)}")
         results['errors'].append(str(e))
+        cleanup_temp_responses()  # Clean up even on error
         return results
 
 def extract_key_value_pairs_with_openai(text_blocks, api_key=None):
@@ -1557,8 +1728,14 @@ def extract_key_value_pairs_with_openai(text_blocks, api_key=None):
     
     openai.api_key = api_key
     
-    # Join text blocks with separators for context
+    # Generate a hash of the text content to use as a cache key
     text_content = "\n---\n".join(text_blocks)
+    content_hash = hashlib.md5(text_content.encode()).hexdigest()
+    
+    # Check for cached response
+    cached_response = load_api_response(content_hash, "kvp")
+    if cached_response:
+        return cached_response
     
     # Prepare the prompt for key-value extraction
     system_prompt = "You are a financial document analysis assistant. Extract key-value pairs from financial documents accurately."
@@ -1602,6 +1779,9 @@ Return ONLY valid JSON array in this format:
         # Get the response content
         content = response.choices[0].message['content'].strip()
         
+        # Save the response to a temporary file
+        save_api_response(content, content_hash, "kvp")
+        
         # Extract JSON from the response
         import re
         json_match = re.search(r'(\[\s*\{.*\}\s*\])', content, re.DOTALL)
@@ -1612,6 +1792,7 @@ Return ONLY valid JSON array in this format:
                 # Parse the JSON response
                 import json
                 key_value_pairs = json.loads(json_str)
+                save_api_response(key_value_pairs, content_hash, "kvp_parsed")
                 return key_value_pairs
             except json.JSONDecodeError as e:
                 print(f"Error parsing JSON response: {e}")
@@ -1656,15 +1837,76 @@ def extract_json_fallback(content):
     
     return pairs
 
+# Add standalone function for extraction only
+def extract_and_save_pdf_data(pdf_path, output_path=None):
+    """
+    Extract data from a PDF and save it to a file without mapping to sheets
+    
+    Args:
+        pdf_path (str): Path to the PDF file
+        output_path (str, optional): Custom path to save the data
+        
+    Returns:
+        dict: Result with paths and status
+    """
+    result = {
+        'success': False,
+        'pdf_processed': False,
+        'data_path': None,
+        'errors': []
+    }
+    
+    try:
+        logger.info(f"Extracting data from PDF: {pdf_path}")
+        
+        # Extract data from PDF
+        financial_data = extract_financial_data_from_pdf(pdf_path)
+        
+        if not financial_data or 'pages' not in financial_data or not financial_data['pages']:
+            logger.error("Failed to extract data from PDF")
+            result['errors'].append("Failed to extract data from PDF")
+            cleanup_temp_responses()
+            return result
+        
+        result['pdf_processed'] = True
+        logger.info(f"Successfully extracted data from PDF: {len(financial_data['pages'])} pages, {len(financial_data['tables'])} tables")
+        
+        # Save the extracted data
+        if output_path:
+            # Use the provided path
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, 'w') as f:
+                json.dump(financial_data, f, indent=2)
+            result['data_path'] = output_path
+        else:
+            # Use the default storage location
+            data_path = save_pdf_data(pdf_path, financial_data)
+            result['data_path'] = data_path
+        
+        result['success'] = result['data_path'] is not None
+        
+        # Clean up temporary files
+        cleanup_temp_responses()
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in extracting and saving PDF data: {str(e)}")
+        result['errors'].append(str(e))
+        cleanup_temp_responses()
+        return result
+
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Process financial PDF to Google Sheets")
     parser.add_argument("pdf_path", help="Path to the PDF file")
-    parser.add_argument("--spreadsheet", help="Google Sheets spreadsheet ID", required=True)
+    parser.add_argument("--spreadsheet", help="Google Sheets spreadsheet ID")
     parser.add_argument("--query", help="User query to focus the update")
     parser.add_argument("--sheets", help="Comma-separated list of sheet names to update")
     parser.add_argument("--output", help="Output file for results (JSON)")
+    parser.add_argument("--extract-only", action="store_true", help="Extract and save data without updating sheets")
+    parser.add_argument("--force-extract", action="store_true", help="Force re-extraction even if data exists")
     
     args = parser.parse_args()
     
@@ -1676,16 +1918,21 @@ if __name__ == "__main__":
     if args.sheets:
         sheet_names = [name.strip() for name in args.sheets.split(',')]
     
-    # Process PDF and update sheets
-    results = process_financial_pdf_to_sheets(
-        args.pdf_path,
-        args.spreadsheet,
-        args.query,
-        sheet_names
-    )
+    if args.extract_only:
+        # Extract and save data only
+        results = extract_and_save_pdf_data(args.pdf_path, args.output)
+    else:
+        # Process PDF and update sheets
+        results = process_financial_pdf_to_sheets(
+            args.pdf_path,
+            args.spreadsheet,
+            args.query,
+            sheet_names,
+            reuse_data=not args.force_extract
+        )
     
     # Output results
-    if args.output:
+    if args.output and not args.extract_only:  # If extract_only, output is used for data
         with open(args.output, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {args.output}")

@@ -15,6 +15,24 @@ def get_credentials():
     """Get Google API credentials from saved token or service account"""
     creds = None
     
+    # First check for credentials.json as service account
+    if os.path.exists('credentials.json'):
+        try:
+            # Try to load as service account first
+            creds = service_account.Credentials.from_service_account_file(
+                'credentials.json', scopes=SCOPES)
+            print("Using credentials.json as service account")
+            
+            # Save a copy to token.json for next time
+            import shutil
+            shutil.copy('credentials.json', 'token.json')
+            print("Copied credentials.json to token.json")
+            
+            return creds
+        except Exception as e:
+            print(f"Error loading credentials.json as service account: {str(e)}")
+            # If loading as service account fails, we'll continue to other methods
+    
     # Check if token.json exists and has content
     if os.path.exists('token.json') and os.path.getsize('token.json') > 0:
         try:
@@ -48,17 +66,18 @@ def get_credentials():
             except Exception as e:
                 print(f"Error with service account: {str(e)}")
         else:
-            # Fall back to OAuth flow if no service account
-            if not os.path.exists('credentials.json'):
+            # Fall back to OAuth flow if no other credentials are available
+            if os.path.exists('credentials.json'):
+                # Try again as OAuth
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+                
+                # Save the credentials for the next run
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
+            else:
                 raise FileNotFoundError(
-                    "No credentials found. Please provide either credentials.json for OAuth or service_account.json")
-            
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-            
-            # Save the credentials for the next run
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
+                    "No credentials found. Please provide credentials.json or service_account.json")
     
     return creds
 
@@ -485,10 +504,33 @@ def apply_mapping_result(sheet_url, mapping_result):
     except Exception as e:
         raise Exception(f"Error applying mapping result: {str(e)}")
 
+def test_google_sheets_access():
+    """Test connection to Google Sheets API and return status"""
+    try:
+        creds = get_credentials()
+        service = build('sheets', 'v4', credentials=creds)
+        
+        # Try to access drive.about API to check if credentials are working
+        sheet_service = build('sheets', 'v4', credentials=creds)
+        result = sheet_service.spreadsheets().get(
+            spreadsheetId="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"  # Google Sheets example spreadsheet ID
+        ).execute()
+        
+        print("✅ Google Sheets API access successful!")
+        print(f"Service account email: {creds._service_account_email if hasattr(creds, '_service_account_email') else 'Not a service account'}")
+        return True
+    except Exception as e:
+        print(f"❌ Google Sheets API access failed: {str(e)}")
+        return False
+
 if __name__ == "__main__":
     # For testing
     import sys
     if len(sys.argv) > 1:
         sheet_url = sys.argv[1]
         result = get_sheet_structure(sheet_url)
-        print(json.dumps(result, indent=2)) 
+        print(json.dumps(result, indent=2))
+    else:
+        # Test authentication
+        print("Testing Google Sheets authentication...")
+        test_google_sheets_access() 
